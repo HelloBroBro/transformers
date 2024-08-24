@@ -76,7 +76,6 @@ from .logits_process import (
     ExponentialDecayLengthPenalty,
     ForcedBOSTokenLogitsProcessor,
     ForcedEOSTokenLogitsProcessor,
-    ForceTokensLogitsProcessor,
     HammingDiversityLogitsProcessor,
     InfNanRemoveLogitsProcessor,
     LogitNormalization,
@@ -865,9 +864,6 @@ class GenerationMixin:
                 if (input_ids_seq_length > 1 or generation_config.forced_bos_token_id is None)
                 else begin_index + 1
             )
-            if generation_config.forced_decoder_ids is not None:
-                # generation starts after the last token that is forced
-                begin_index += generation_config.forced_decoder_ids[-1][0]
             processors.append(
                 SuppressTokensAtBeginLogitsProcessor(
                     generation_config.begin_suppress_tokens,
@@ -876,12 +872,11 @@ class GenerationMixin:
                 )
             )
         if generation_config.forced_decoder_ids is not None:
-            # TODO(Sanchit): deprecate in v4.40 by removing this logic
-            warnings.warn(
-                "You have explicitly specified `forced_decoder_ids`. This functionality has been deprecated and will throw an error in v4.40. Please remove the `forced_decoder_ids` argument in favour of `input_ids` or `decoder_input_ids` respectively.",
-                FutureWarning,
+            # TODO (sanchit): move this exception to GenerationConfig.validate() when TF & FLAX are aligned with PT
+            raise ValueError(
+                "You have explicitly specified `forced_decoder_ids`. Please remove the `forced_decoder_ids` argument "
+                "in favour of `input_ids` or `decoder_input_ids` respectively.",
             )
-            processors.append(ForceTokensLogitsProcessor(generation_config.forced_decoder_ids, _has_warned=True))
         if generation_config.watermarking_config is not None:
             processors.append(
                 WatermarkLogitsProcessor(
@@ -1344,19 +1339,18 @@ class GenerationMixin:
         using_model_generation_config = False
         if generation_config is None:
             # legacy: users may modify the model configuration to control generation. To trigger this legacy behavior,
-            # three conditions must be met
+            # the following conditions must be met
             # 1) the generation config must have been created from the model config (`_from_model_config` field);
             # 2) the generation config must have seen no modification since its creation (the hash is the same);
             # 3) the user must have set generation parameters in the model config.
             # NOTE: `torch.compile` can't compile `hash`, this legacy support is disabled with compilation.
             if (
                 not is_torchdynamo_compiling()
-                and self.generation_config._from_model_config
-                and self.generation_config._original_object_hash == hash(self.generation_config)
-                and self.config._has_non_default_generation_parameters()
+                and self.generation_config._from_model_config  # 1)
+                and self.generation_config._original_object_hash == hash(self.generation_config)  # 2)
             ):
                 new_generation_config = GenerationConfig.from_model_config(self.config)
-                if new_generation_config != self.generation_config:
+                if new_generation_config != self.generation_config:  # 3)
                     warnings.warn(
                         "You have modified the pretrained model configuration to control generation. This is a"
                         " deprecated strategy to control generation and will be removed soon, in a future version."
@@ -1600,6 +1594,13 @@ class GenerationMixin:
                 if not requires_cross_attention_cache
                 else EncoderDecoderCache(DynamicCache(), DynamicCache())
             )
+
+    def _supports_num_logits_to_keep(self) -> bool:
+        """
+        Return True if the current model supports the keyword argument `num_logits_to_keep` in forward()
+        to save memory. Checking it in this way allows to avoid using a new model attribute.
+        """
+        return "num_logits_to_keep" in set(inspect.signature(self.forward).parameters.keys())
 
     def _prepare_special_tokens(
         self,
@@ -1876,6 +1877,13 @@ class GenerationMixin:
             inputs_tensor=inputs_tensor,
             input_ids_length=input_ids_length,
         )
+
+        # If the model supports `num_logits_to_keep` in forward(), set it to 1 to avoid computing the whole
+        # logit matrix. This can save a lot of memory during the first forward pass. Note that assisted decoding
+        # dynamically overrides this value as it can need more than the last token logits
+        if self._supports_num_logits_to_keep() and "num_logits_to_keep" not in model_kwargs:
+            model_kwargs["num_logits_to_keep"] = 1
+
         self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
 
         # 7. Prepare the cache.
@@ -2273,13 +2281,6 @@ class GenerationMixin:
 
         return input_ids
 
-    def contrastive_search(self, *args, **kwargs):
-        logger.warning_once(
-            "Calling `contrastive_search` directly is deprecated and will be removed in v4.41. Use `generate` or a "
-            "custom generation loop instead.",
-        )
-        return self._contrastive_search(*args, **kwargs)
-
     def _dola_decoding(
         self,
         input_ids: torch.LongTensor,
@@ -2412,8 +2413,9 @@ class GenerationMixin:
                 output_hidden_states=True,
             )
 
-            final_layer_next_token_logits = outputs.logits[:, -1, :].detach().clone()
-            final_logits = outputs.logits[:, -1, :]
+            # .float() is needed to retain precision for later logits manipulations
+            final_layer_next_token_logits = outputs.logits[:, -1, :].detach().clone().float()
+            final_logits = outputs.logits[:, -1, :].float()
             candidate_premature_logits = {}
             for candidate_premature_layer in candidate_premature_layers:
                 candidate_premature_logits[candidate_premature_layer] = lm_head(
@@ -2590,7 +2592,8 @@ class GenerationMixin:
                 # next logit for contrastive search to select top-k candidate tokens
                 # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for this first iteration
                 # (the clone itself is always small)
-                logit_for_next_step = outputs.logits[:, -1, :].clone()
+                # .float() is needed to retain precision for later logits manipulations
+                logit_for_next_step = outputs.logits[:, -1, :].clone().float()
 
                 model_kwargs = self._update_model_kwargs_for_generation(
                     outputs,
@@ -2720,7 +2723,8 @@ class GenerationMixin:
                 next_hidden = outputs.hidden_states[-1]
                 full_hidden_states = outputs.hidden_states
 
-            logits = outputs.logits[:, -1, :]
+            # .float() is needed to retain precision for later logits manipulations
+            logits = outputs.logits[:, -1, :].float()
             context_hidden = last_hidden_states.repeat_interleave(top_k, dim=0)
 
             # compute the degeneration penalty and re-rank the candidates based on the degeneration penalty and the
@@ -2966,7 +2970,8 @@ class GenerationMixin:
 
             # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
             # (the clone itself is always small)
-            next_token_logits = outputs.logits[:, -1, :].clone()
+            # .float() is needed to retain precision for later logits manipulations
+            next_token_logits = outputs.logits[:, -1, :].clone().float()
 
             # pre-process distribution
             next_token_scores = logits_processor(input_ids, next_token_logits)
@@ -3210,7 +3215,8 @@ class GenerationMixin:
 
             # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
             # (the clone itself is always small)
-            next_token_logits = outputs.logits[:, -1, :].clone()
+            # .float() is needed to retain precision for later logits manipulations
+            next_token_logits = outputs.logits[:, -1, :].clone().float()
             next_token_scores = nn.functional.log_softmax(
                 next_token_logits, dim=-1
             )  # (batch_size * num_beams, vocab_size)
@@ -3484,7 +3490,8 @@ class GenerationMixin:
 
                 # select outputs of beams of current group only
                 # No need to clone() the logits here as they will not retain outputs.logits at the end of the loop
-                next_token_logits = outputs.logits[batch_group_indices, -1, :]
+                # .float() is needed to retain precision for later logits manipulations
+                next_token_logits = outputs.logits[batch_group_indices, -1, :].float()
 
                 next_token_scores = nn.functional.log_softmax(
                     next_token_logits, dim=-1
@@ -3739,7 +3746,8 @@ class GenerationMixin:
 
             # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
             # (the clone itself is always small)
-            next_token_logits = outputs.logits[:, -1, :].clone()
+            # .float() is needed to retain precision for later logits manipulations
+            next_token_logits = outputs.logits[:, -1, :].clone().float()
             next_token_scores = nn.functional.log_softmax(
                 next_token_logits, dim=-1
             )  # (batch_size * num_beams, vocab_size)
@@ -3998,7 +4006,8 @@ class GenerationMixin:
             outputs = self(**model_inputs)
 
             # 2.3. Process the new logits
-            new_logits = outputs.logits[:, -candidate_length - 1 :]  # excludes the input prompt if present
+            # .float() is needed to retain precision for later logits manipulations
+            new_logits = outputs.logits[:, -candidate_length - 1 :].float()  # excludes the input prompt if present
             next_token_logits = new_logits.clone()
             if len(logits_processor) > 0:
                 for i in range(candidate_length + 1):
