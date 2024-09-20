@@ -1154,7 +1154,7 @@ class GenerationMixin:
                     "Ensure you load the assistant with the correct encoder-decoder class, e.g. `AutoModelForSpeechSeq2Seq` for Whisper."
                 )
 
-        if not self.config.vocab_size == assistant_model.config.vocab_size:
+        if not self.config.get_text_config().vocab_size == assistant_model.config.get_text_config().vocab_size:
             raise ValueError("Make sure the main and assistant model use the same tokenizer")
 
     def _validate_model_kwargs(self, model_kwargs: Dict[str, Any]):
@@ -1476,7 +1476,7 @@ class GenerationMixin:
             layer_device_map = get_layer_device_map(execution_device_map)
 
             cache_kwargs = {
-                "config": self.config if hasattr(self.config, "text_config") else self.config,
+                "config": self.config.get_text_config(),
                 "max_batch_size": batch_size,
                 "max_cache_len": max_cache_len,
                 "device": device,
@@ -1864,6 +1864,10 @@ class GenerationMixin:
             model_kwargs["attention_mask"] = self._prepare_attention_mask_for_generation(
                 inputs_tensor, generation_config._pad_token_tensor, generation_config._eos_token_tensor
             )
+        elif kwargs_has_attention_mask:
+            # TODO (joao): generalize this check with other types of inputs
+            if model_input_name == "input_ids" and len(model_kwargs["attention_mask"].shape) > 2:
+                raise ValueError("`attention_mask` passed to `generate` must be 2D.")
 
         if self.config.is_encoder_decoder and "encoder_outputs" not in model_kwargs:
             # if model is encoder decoder encoder_outputs are created and added to `model_kwargs`
